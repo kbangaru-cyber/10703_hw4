@@ -128,7 +128,31 @@ class TrainDiffusionPolicy:
         NOTE: remember that you are predicting max_action_len actions, not just one
         """
         # BEGIN STUDENT SOLUTION
+        self.model.eval()
+        B = previous_states.shape[0]
+        A = max_action_len
+        act_dim = self.action_dimension
 
+        xt = torch.randn((B, A, act_dim), device=self.device)
+
+        timesteps = self.get_inference_timesteps()
+        for t in timesteps:
+            noise_pred = self.model(
+                previous_states=previous_states,
+                previous_actions=previous_actions,
+                noisy_actions=xt,
+                episode_timesteps=episode_timesteps,
+                noise_timesteps=t.expand(B),
+                previous_states_mask=previous_states_padding_mask,
+                previous_actions_mask=previous_actions_padding_mask,
+                actions_padding_mask=actions_padding_mask,
+            )
+            step_out = self.inference_scheduler.step(
+                model_output=noise_pred, timestep=t, sample=xt
+            )
+            xt = step_out.prev_sample
+
+        predicted_actions = xt
         # END STUDENT SOLUTION
         return predicted_actions
 
@@ -157,9 +181,95 @@ class TrainDiffusionPolicy:
         """
         rewards, rgbs = np.zeros((self.max_trajectory_length,)), []
         # BEGIN STUDENT SOLUTION
+        assert num_previous_states == num_previous_actions + 1
+        self.model.eval()
+        rewards, rgbs = np.zeros((self.max_trajectory_length,)), []
 
+        state, _ = env.reset()
+        done = False
+        truncated = False
+        t = 0
+
+        prev_states_list = []
+        prev_actions_list = []
+
+        with torch.no_grad():
+            while (not done) and (not truncated) and (t < self.max_trajectory_length):
+                # Build conditioning window (pad to fixed lengths)
+                ps = np.array(prev_states_list[-num_previous_states+1:] + [state], dtype=np.float32)
+                pa = np.array(prev_actions_list[-num_previous_actions:], dtype=np.float32) if len(prev_actions_list)>0 else np.zeros((0, self.action_dimension), dtype=np.float32)
+
+                # normalize inputs
+                ps_norm = (ps - self.states_mean) / self.states_std
+                pa_norm = (pa - self.actions_mean) / self.actions_std
+
+                # pad sequences (pad to the RIGHT/end with zeros; masks True where padded)
+                if ps_norm.shape[0] < num_previous_states:
+                    pad_s = num_previous_states - ps_norm.shape[0]
+                    ps_norm = np.concatenate([ps_norm, np.zeros((pad_s, self.state_dimension), dtype=np.float32)], axis=0)
+                    ps_mask = np.concatenate([np.zeros(ps.shape[0]), np.ones(pad_s)]).astype(bool)
+                else:
+                    ps_mask = np.zeros(num_previous_states, dtype=bool)
+
+                if pa_norm.shape[0] < num_previous_actions:
+                    pad_a = num_previous_actions - pa_norm.shape[0]
+                    pa_norm = np.concatenate([pa_norm, np.zeros((pad_a, self.action_dimension), dtype=np.float32)], axis=0)
+                    pa_mask = np.concatenate([np.zeros(pa.shape[0]), np.ones(pad_a)]).astype(bool)
+                else:
+                    pa_mask = np.zeros(num_previous_actions, dtype=bool)
+
+                # actions padding (we always intend to predict N actions here, so no padding)
+                actions_pad = np.zeros((num_actions_to_eval_in_a_row,), dtype=bool)
+
+                # to tensors
+                prev_states_t = torch.from_numpy(ps_norm).float().unsqueeze(0).to(self.device)
+                prev_actions_t = torch.from_numpy(pa_norm).float().unsqueeze(0).to(self.device)
+                ep_ts = torch.arange(
+                    max(0, t - (num_previous_states - 1)), t + 1, dtype=torch.long, device=self.device
+                )
+                if ep_ts.shape[0] < num_previous_states:
+                    # pad episode timesteps to match num_previous_states
+                    pad = num_previous_states - ep_ts.shape[0]
+                    ep_ts = torch.cat([ep_ts, ep_ts.new_zeros(pad)], dim=0)
+                ep_ts = ep_ts.unsqueeze(0)
+
+                ps_mask_t = torch.from_numpy(ps_mask).unsqueeze(0).to(self.device)
+                pa_mask_t = torch.from_numpy(pa_mask).unsqueeze(0).to(self.device)
+                act_pad_t = torch.from_numpy(actions_pad).unsqueeze(0).to(self.device)
+
+                # diffusion sample -> normalized actions
+                actions_norm = self.diffusion_sample(
+                    previous_states=prev_states_t,
+                    previous_actions=prev_actions_t,
+                    episode_timesteps=ep_ts,
+                    previous_states_padding_mask=ps_mask_t,
+                    previous_actions_padding_mask=pa_mask_t,
+                    actions_padding_mask=act_pad_t,
+                    max_action_len=num_actions_to_eval_in_a_row,
+                )
+
+                # denormalize, clip to env range [-1,1]
+                actions = actions_norm.cpu().numpy() * self.actions_std + self.actions_mean
+                actions = np.clip(actions, -self.clip_sample_range, self.clip_sample_range)[0]
+
+                # Apply up to N actions or until termination
+                for i in range(num_actions_to_eval_in_a_row):
+                    if done or truncated:
+                        break
+                    next_state, r, done, truncated, _ = env.step(actions[i])
+                    rewards[t] = r
+                    if render:
+                        rgbs.append(env.render())
+                    # push into histories (store *denormalized* actions in history)
+                    prev_states_list.append(state)
+                    prev_actions_list.append(actions[i])
+                    state = next_state
+                    t += 1
+                    if t >= self.max_trajectory_length:
+                        break
+                        
         # END STUDENT SOLUTION
-        return rewards,
+        return rewards,rgbs
 
     def evaluation(
         self,
@@ -267,7 +377,43 @@ class TrainDiffusionPolicy:
         NOTE: return a loss value that is a plain float (not a tensor), and is on cpu
         """
         # BEGIN STUDENT SOLUTION
+        (
+            prev_states, prev_actions, actions, ep_timesteps,
+            prev_states_pad, prev_actions_pad, actions_pad
+        ) = self.get_training_batch(batch_size=batch_size)
 
+        noise = torch.randn_like(actions)
+        t = torch.randint(
+            low=1, high=self.num_train_diffusion_timesteps, size=(actions.shape[0],), device=self.device
+        )
+
+        noisy_actions = self.training_scheduler.add_noise(
+            original_samples=actions, noise=noise, timesteps=t
+        )
+
+        noise_pred = self.model(
+            previous_states=prev_states,
+            previous_actions=prev_actions,
+            noisy_actions=noisy_actions,
+            episode_timesteps=ep_timesteps,
+            noise_timesteps=t,
+            previous_states_mask=prev_states_pad,
+            previous_actions_mask=prev_actions_pad,
+            actions_padding_mask=actions_pad,
+        )
+
+        mask = ~actions_pad 
+        mask = mask.unsqueeze(-1).expand_as(noise)
+
+        mse = torch.nn.MSELoss(reduction="none")
+        loss_per_elem = mse(noise_pred, noise)
+        loss = (loss_per_elem * mask.float()).sum() / mask.float().sum().clamp_min(1.0)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+
+        loss = float(loss.detach().cpu().item())
         # END STUDENT SOLUTION
 
         return loss
@@ -373,7 +519,34 @@ def run_training():
     with open(f"data/actions_BC.pkl", "rb") as f:
         actions = pickle.load(f)
     # BEGIN STUDENT SOLUTION
-    trainer = TrainDiffusionPolicy(...)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = PolicyDiffusionTransformer(
+        num_transformer_layers=6,
+        state_dim=24,
+        act_dim=4,
+        hidden_size=128,
+        max_episode_length=1600,
+        n_transformer_heads=1,
+        device=device,
+        target="diffusion_policy",
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-3)
+
+    trainer = TrainDiffusionPolicy(
+        env=env,
+        model=model,
+        optimizer=optimizer,
+        states_array=states,
+        actions_array=actions,
+        device=device,
+        num_train_diffusion_timesteps=30,
+        max_trajectory_length=1600,
+    )
+
+    # Train for 50k iters with batch 256 per spec
+    trainer.train(num_training_steps=50000, batch_size=256, print_every=5000, save_every=10000)
+
     # END STUDENT SOLUTION
     trainer.evaluation(num_samples=30)
     traj_reward = 0
