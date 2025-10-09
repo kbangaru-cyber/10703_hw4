@@ -129,6 +129,36 @@ class TrainDaggerBC:
         NOTE: you should update self.states, self.actions, and self.timesteps in this function.
         """
         # BEGIN STUDENT SOLUTION
+        assert self.mode == "DAgger", "update_training_data is only used for DAgger"
+        rewards = []
+
+        all_states, all_actions, all_timesteps = [], [], []
+
+        for _ in range(num_trajectories_per_batch_collection):
+            states, _, timesteps, rewards_one, _ = self.generate_trajectory(self.env, self.model, render=False)
+            rewards.append(sum(rewards_one))
+
+            # Query expert on each visited state to get the *label* action
+            expert_actions = []
+            for s in states:
+                expert_actions.append(self.call_expert_policy(s))
+            # aggregate
+            all_states.append(np.array(states, dtype=np.float32))
+            all_actions.append(np.array(expert_actions, dtype=np.float32))
+            all_timesteps.append(np.arange(len(states), dtype=np.int64))
+
+        all_states = np.concatenate(all_states, axis=0) if len(all_states) > 0 else np.zeros((0, ))
+        all_actions = np.concatenate(all_actions, axis=0) if len(all_actions) > 0 else np.zeros((0, ))
+        all_timesteps = np.concatenate(all_timesteps, axis=0) if len(all_timesteps) > 0 else np.zeros((0, ))
+
+        if self.states is None:
+            self.states = all_states
+            self.actions = np.clip(all_actions, -1, 1)
+            self.timesteps = all_timesteps
+        else:
+            self.states = np.concatenate([self.states, all_states], axis=0)
+            self.actions = np.concatenate([self.actions, np.clip(all_actions, -1, 1)], axis=0)
+            self.timesteps = np.concatenate([self.timesteps, all_timesteps], axis=0)
 
         # END STUDENT SOLUTION
 
@@ -144,6 +174,9 @@ class TrainDaggerBC:
         NOTE: you will need to call self.generate_trajectory in this function.
         """
         # BEGIN STUDENT SOLUTION
+        for _ in range(num_trajectories_per_batch_collection):
+            _, _, _, r, _ = self.generate_trajectory(self.env, self.model, render=False)
+            rewards.append(sum(r))
 
         # END STUDENT SOLUTION
 
@@ -179,6 +212,31 @@ class TrainDaggerBC:
         self.model.train()
         mean_rewards, median_rewards, max_rewards = [], [], []
         # BEGIN STUDENT SOLUTION
+        losses = np.zeros(num_batch_collection_steps * num_training_steps_per_batch_collection)
+        self.model.train()
+        mean_rewards, median_rewards, max_rewards = [], [], []
+
+        cur = 0
+        for batch_idx in range(num_batch_collection_steps):
+            if self.mode == "BC":
+                # BC: dataset already loaded in __init__, just train
+                for k in range(num_training_steps_per_batch_collection):
+                    loss = self.training_step(batch_size)
+                    losses[cur] = loss
+                    cur += 1
+                # Evaluate after this block
+                batch_rewards = self.generate_trajectories(num_trajectories_per_batch_collection)
+            else:
+                # DAgger: collect on-policy states, label with expert (aggregate dataset), then train
+                batch_rewards = self.update_training_data(num_trajectories_per_batch_collection)
+                for k in range(num_training_steps_per_batch_collection):
+                    loss = self.training_step(batch_size)
+                    losses[cur] = loss
+                    cur += 1
+
+            mean_rewards.append(float(np.mean(batch_rewards)))
+            median_rewards.append(float(np.median(batch_rewards)))
+            max_rewards.append(float(np.max(batch_rewards)))
 
         # END STUDENT SOLUTION
         x_axis = np.arange(0, len(mean_rewards)) * num_training_steps_per_batch_collection
@@ -251,7 +309,16 @@ def run_training(dagger: bool):
         model_weights = torch.load(f"data/models/super_expert_PPO_model.pt", map_location=device)
         expert_model.load_state_dict(model_weights["PolicyNet"])
         # BEGIN STUDENT SOLUTION
-        trainer = TrainDaggerBC(...)
+        trainer = TrainDaggerBC(
+            env=env,
+            model=model,
+            optimizer=optimizer,
+            states=states,        # unused for DAgger init
+            actions=actions,      # unused for DAgger init
+            expert_model=expert_model,
+            device=device,
+            mode="DAgger",
+        )
         # END STUDENT SOLUTION
         traj_reward = 0
         while traj_reward < 260:
@@ -261,7 +328,19 @@ def run_training(dagger: bool):
             imageio.mimsave(f'gifs_{trainer.mode}.gif', rgbs, fps=33)
     else:
         # BEGIN STUDENT SOLUTION
-        trainer = TrainDaggerBC(...)
+        model = SimpleNet(state_dim=24, action_dim=4, hidden_layer_dimension=128, max_episode_length=1600, device=device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+        trainer = TrainDaggerBC(
+            env=env,
+            model=model,
+            optimizer=optimizer,
+            states=states,
+            actions=actions,
+            expert_model=None,
+            device=device,
+            mode="BC",
+        )
         # END STUDENT SOLUTION
         traj_reward = 1
         while traj_reward > 0:
