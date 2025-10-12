@@ -2,6 +2,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 from torch import nn
+print('device:', 'cuda' if torch.cuda.is_available() else 'cpu')
+
 import argparse
 import imageio
 from modules import PolicyNet
@@ -9,11 +11,31 @@ from simple_network import SimpleNet
 from tqdm import tqdm
 import pickle
 import matplotlib.pyplot as plt
-
+import os
 try:
     import wandb
 except ImportError:
     wandb = None
+
+import warnings
+warnings.filterwarnings("ignore", message=".*UnsupportedFieldAttributeWarning.*")
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1" 
+
+def pick_device() -> str:
+    """
+    Use CUDA if available and kernels actually run; otherwise fall back to CPU.
+    This avoids crashes on very new GPUs whose SM arch isn't baked into your wheel.
+    """
+    if torch.cuda.is_available():
+        try:
+            torch.empty(1, device="cuda").fill_(0) 
+            return "cuda"
+        except Exception as e:
+            print("CUDA present but kernels unsupported -> using CPU. Detail:", e)
+    return "cpu"
 
 class TrainDaggerBC:
 
@@ -34,28 +56,28 @@ class TrainDaggerBC:
         self.expert_model = expert_model
         self.optimizer = optimizer
         self.device = device
-        model.set_device(self.device)
-
+        self.model.set_device(self.device)
         self.mode = mode
 
         if self.mode == "BC":
-            self.states = []
-            self.actions = []
-            self.timesteps = []
-            for trajectory in range(states.shape[0]):
-                trajectory_mask = states[trajectory].sum(axis=1) != 0
-                self.states.append(states[trajectory][trajectory_mask])
-                self.actions.append(actions[trajectory][trajectory_mask])
-                self.timesteps.append(np.arange(0, len(trajectory_mask)))
+            self.states, self.actions, self.timesteps = [], [], []
+            for traj_idx in range(states.shape[0]):
+                mask = (states[traj_idx].sum(axis=1) != 0) 
+                s_traj = states[traj_idx][mask]
+                a_traj = actions[traj_idx][mask]
+                self.states.append(s_traj)
+                self.actions.append(a_traj)
+                self.timesteps.append(np.arange(len(s_traj), dtype=np.int64))
+
             self.states = np.concatenate(self.states, axis=0)
             self.actions = np.concatenate(self.actions, axis=0)
             self.timesteps = np.concatenate(self.timesteps, axis=0)
 
-            self.clip_sample_range = 1
-            self.actions = np.clip(self.actions, -self.clip_sample_range, self.clip_sample_range)
+            self.actions = np.clip(self.actions, -1.0, 1.0)
 
         else:
             self.expert_model = self.expert_model.to(self.device)
+            self.expert_model.eval()
             self.states = None
             self.actions = None
             self.timesteps = None
@@ -81,26 +103,37 @@ class TrainDaggerBC:
         states, old_actions, timesteps, rewards, rgbs = [], [], [], [], []
 
         done, trunc = False, False
-        cur_state, _ = env.reset()  
+        cur_state, _ = env.reset()
         if render:
             rgbs.append(env.render())
+
         t = 0
-        while (not done) and (not trunc):
-            with torch.no_grad():
-                p = policy(torch.from_numpy(cur_state).to(self.device).float().unsqueeze(0), torch.tensor(t).to(self.device).long().unsqueeze(0))
-            a = p.cpu().numpy()[0]
-            next_state, reward, done, trunc, _ = env.step(a)
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            while (not done) and (not trunc):
+                p = policy(
+                    torch.from_numpy(cur_state).to(self.device).float().unsqueeze(0),
+                    torch.tensor(t, device=self.device, dtype=torch.long).unsqueeze(0),
+                )
+                a = p.squeeze(0).detach().cpu().numpy()
+                a = np.clip(a, -1.0, 1.0) 
 
-            states.append(cur_state)
-            old_actions.append(a)
-            timesteps.append(t)
-            rewards.append(reward)
-            if render:
-                rgbs.append(env.render())
+                next_state, reward, done, trunc, _ = env.step(a)
 
-            t += 1
+                states.append(cur_state)
+                old_actions.append(a)
+                timesteps.append(t)
+                rewards.append(reward)
 
-            cur_state = next_state
+                if render:
+                    rgbs.append(env.render())
+
+                t += 1
+                cur_state = next_state
+
+        if was_training:
+            self.model.train()
 
         return states, old_actions, timesteps, rewards, rgbs
 
@@ -113,9 +146,9 @@ class TrainDaggerBC:
         """
         # takes in a np array state and returns an np array action
         with torch.no_grad():
-            state_tensor = torch.tensor(np.expand_dims(state, axis=0), dtype=torch.float32, device=self.device)
-            action = self.expert_model.choose_action(state_tensor, deterministic=True).cpu().numpy()
-            action = np.clip(action, -1, 1)[0]
+            s = torch.tensor(state[None, :], dtype=torch.float32, device=self.device)
+            action = self.expert_model.choose_action(s, deterministic=True).detach().cpu().numpy()[0]
+            action = np.clip(action, -1.0, 1.0)
         return action
 
     def update_training_data(self, num_trajectories_per_batch_collection=20):
@@ -129,40 +162,43 @@ class TrainDaggerBC:
         NOTE: you should update self.states, self.actions, and self.timesteps in this function.
         """
         # BEGIN STUDENT SOLUTION
-        assert self.mode == "DAgger", "update_training_data is only used for DAgger"
-        rewards = []
+        assert self.mode == "DAgger", "update_training_data is only for DAgger"
 
-        all_states, all_actions, all_timesteps = [], [], []
+        rewards_per_traj = []
+        collected_states, collected_actions, collected_timesteps = [], [], []
 
         for _ in range(num_trajectories_per_batch_collection):
-            states, _, timesteps, rewards_one, _ = self.generate_trajectory(self.env, self.model, render=False)
-            rewards.append(sum(rewards_one))
+            states, _, ts, rewards, _ = self.generate_trajectory(self.env, self.model, render=False)
+            rewards_per_traj.append(float(np.sum(rewards)))
 
-            # Query expert on each visited state to get the *label* action
-            expert_actions = []
-            for s in states:
-                expert_actions.append(self.call_expert_policy(s))
-            # aggregate
-            all_states.append(np.array(states, dtype=np.float32))
-            all_actions.append(np.array(expert_actions, dtype=np.float32))
-            all_timesteps.append(np.arange(len(states), dtype=np.int64))
+            # label each visited state with expert
+            expert_actions = [self.call_expert_policy(s) for s in states]
 
-        all_states = np.concatenate(all_states, axis=0) if len(all_states) > 0 else np.zeros((0, ))
-        all_actions = np.concatenate(all_actions, axis=0) if len(all_actions) > 0 else np.zeros((0, ))
-        all_timesteps = np.concatenate(all_timesteps, axis=0) if len(all_timesteps) > 0 else np.zeros((0, ))
+            collected_states.append(np.asarray(states, dtype=np.float32))
+            collected_actions.append(np.asarray(expert_actions, dtype=np.float32))
+            collected_timesteps.append(np.arange(len(states), dtype=np.int64))
+
+        if len(collected_states) > 0:
+            S = np.concatenate(collected_states, axis=0)
+            A = np.concatenate(collected_actions, axis=0)
+            T = np.concatenate(collected_timesteps, axis=0)
+        else:
+            S = np.zeros((0, 24), dtype=np.float32)
+            A = np.zeros((0, 4), dtype=np.float32)
+            T = np.zeros((0,), dtype=np.int64)
+
+        A = np.clip(A, -1.0, 1.0)
 
         if self.states is None:
-            self.states = all_states
-            self.actions = np.clip(all_actions, -1, 1)
-            self.timesteps = all_timesteps
+            self.states, self.actions, self.timesteps = S, A, T
         else:
-            self.states = np.concatenate([self.states, all_states], axis=0)
-            self.actions = np.concatenate([self.actions, np.clip(all_actions, -1, 1)], axis=0)
-            self.timesteps = np.concatenate([self.timesteps, all_timesteps], axis=0)
+            self.states = np.concatenate([self.states, S], axis=0)
+            self.actions = np.concatenate([self.actions, A], axis=0)
+            self.timesteps = np.concatenate([self.timesteps, T], axis=0)
 
         # END STUDENT SOLUTION
 
-        return rewards
+        return rewards_per_traj
 
     def generate_trajectories(self, num_trajectories_per_batch_collection=20):
         """
@@ -173,10 +209,11 @@ class TrainDaggerBC:
         
         NOTE: you will need to call self.generate_trajectory in this function.
         """
+        rewards = []
         # BEGIN STUDENT SOLUTION
         for _ in range(num_trajectories_per_batch_collection):
             _, _, _, r, _ = self.generate_trajectory(self.env, self.model, render=False)
-            rewards.append(sum(r))
+            rewards.append(float(np.sum(r)))
 
         # END STUDENT SOLUTION
 
@@ -208,35 +245,34 @@ class TrainDaggerBC:
         NOTE: for DAgger, you will need to call the self.training_step and self.update_training_data function.
         """
 
-        losses = np.zeros(num_batch_collection_steps * num_training_steps_per_batch_collection)
-        self.model.train()
-        mean_rewards, median_rewards, max_rewards = [], [], []
         # BEGIN STUDENT SOLUTION
-        losses = np.zeros(num_batch_collection_steps * num_training_steps_per_batch_collection)
-        self.model.train()
+        total_updates = num_batch_collection_steps * num_training_steps_per_batch_collection
+        losses = np.zeros(total_updates, dtype=np.float32)
         mean_rewards, median_rewards, max_rewards = [], [], []
 
+        self.model.train()
         cur = 0
-        for batch_idx in range(num_batch_collection_steps):
+        for b in range(num_batch_collection_steps):
             if self.mode == "BC":
-                # BC: dataset already loaded in __init__, just train
-                for k in range(num_training_steps_per_batch_collection):
-                    loss = self.training_step(batch_size)
+                for s in range(num_training_steps_per_batch_collection):
+                    loss = self.training_step(batch_size=batch_size)
                     losses[cur] = loss
                     cur += 1
-                # Evaluate after this block
-                batch_rewards = self.generate_trajectories(num_trajectories_per_batch_collection)
+                    if (s + 1) % print_every == 0:
+                        print(f"[BC   batch {b+1:02d}] step {s+1:04d} | loss {loss:.4f}")
+                batch_returns = self.generate_trajectories(num_trajectories_per_batch_collection)
             else:
-                # DAgger: collect on-policy states, label with expert (aggregate dataset), then train
-                batch_rewards = self.update_training_data(num_trajectories_per_batch_collection)
-                for k in range(num_training_steps_per_batch_collection):
-                    loss = self.training_step(batch_size)
+                batch_returns = self.update_training_data(num_trajectories_per_batch_collection)
+                for s in range(num_training_steps_per_batch_collection):
+                    loss = self.training_step(batch_size=batch_size)
                     losses[cur] = loss
                     cur += 1
+                    if (s + 1) % print_every == 0:
+                        print(f"[DAggr batch {b+1:02d}] step {s+1:04d} | loss {loss:.4f}")
 
-            mean_rewards.append(float(np.mean(batch_rewards)))
-            median_rewards.append(float(np.median(batch_rewards)))
-            max_rewards.append(float(np.max(batch_rewards)))
+            m, md, mx = float(np.mean(batch_returns)), float(np.median(batch_returns)), float(np.max(batch_returns))
+            mean_rewards.append(m); median_rewards.append(md); max_rewards.append(mx)
+            print(f"[{self.mode} batch {b+1:02d}] mean {m:.1f} | median {md:.1f} | max {mx:.1f}")
 
         # END STUDENT SOLUTION
         x_axis = np.arange(0, len(mean_rewards)) * num_training_steps_per_batch_collection
@@ -262,19 +298,13 @@ class TrainDaggerBC:
             batch_size: the batch size to use for training.
         """
         states, actions, timesteps = self.get_training_batch(batch_size=batch_size)
-
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        timesteps = timesteps.to(self.device)
-
         loss_fn = nn.MSELoss()
-        self.optimizer.zero_grad()
-        predicted_actions = self.model(states, timesteps)
-        loss = loss_fn(predicted_actions, actions)
+        self.optimizer.zero_grad(set_to_none=True)
+        pred = self.model(states, timesteps)
+        loss = loss_fn(pred, actions)
         loss.backward()
         self.optimizer.step()
-
-        return loss.detach().cpu().item()
+        return float(loss.detach().cpu().item())
 
     def get_training_batch(self, batch_size=64):
         """
@@ -284,12 +314,11 @@ class TrainDaggerBC:
             batch_size: the batch size to use for training.
         """
         # get random states, actions, and timesteps
-        indices = np.random.choice(len(self.states), size=batch_size, replace=False)
-        states = torch.tensor(self.states[indices], device=self.device).float()
-        actions = torch.tensor(self.actions[indices], device=self.device).float()
-        timesteps = torch.tensor(self.timesteps[indices], device=self.device)
-            
-        
+        assert self.states is not None and len(self.states) > 0, "No training data available."
+        idx = np.random.choice(len(self.states), size=batch_size, replace=False)
+        states = torch.tensor(self.states[idx], device=self.device).float()
+        actions = torch.tensor(self.actions[idx], device=self.device).float()
+        timesteps = torch.tensor(self.timesteps[idx], device=self.device).long()
         return states, actions, timesteps
 
 def run_training(dagger: bool):
@@ -303,55 +332,73 @@ def run_training(dagger: bool):
     with open(f"data/actions_BC.pkl", "rb") as f:
         actions = pickle.load(f)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     if dagger:
         # Load expert model
-        expert_model = PolicyNet(24, 4)
-        model_weights = torch.load(f"data/models/super_expert_PPO_model.pt", map_location=device)
-        expert_model.load_state_dict(model_weights["PolicyNet"])
+        expert_model = PolicyNet(24, 4).to(device)
+        ckpt_path = os.path.join("data", "models", "super_expert_PPO_model.pt")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        expert_model.load_state_dict(ckpt["PolicyNet"])
+        expert_model.eval()
         # BEGIN STUDENT SOLUTION
-        trainer = TrainDaggerBC(
-            env=env,
-            model=model,
-            optimizer=optimizer,
-            states=states,        # unused for DAgger init
-            actions=actions,      # unused for DAgger init
-            expert_model=expert_model,
-            device=device,
-            mode="DAgger",
+        model = SimpleNet(
+            state_dim=24, action_dim=4,
+            hidden_layer_dimension=128, max_episode_length=1600,
+            device=device
         )
-        # END STUDENT SOLUTION
-        traj_reward = 0
-        while traj_reward < 260:
-            _, _, _, rewards, rgbs = trainer.generate_trajectory(trainer.env, trainer.model, render=True)
-            traj_reward = sum(rewards)
-            print(f"got trajectory with reward {traj_reward}")
-            imageio.mimsave(f'gifs_{trainer.mode}.gif', rgbs, fps=33)
-    else:
-        # BEGIN STUDENT SOLUTION
-        model = SimpleNet(state_dim=24, action_dim=4, hidden_layer_dimension=128, max_episode_length=1600, device=device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
         trainer = TrainDaggerBC(
-            env=env,
-            model=model,
-            optimizer=optimizer,
-            states=states,
-            actions=actions,
-            expert_model=None,
-            device=device,
-            mode="BC",
+            env=env, model=model, optimizer=optimizer,
+            states=states, actions=actions,   # not used in DAgger loop
+            expert_model=expert_model, device=device, mode="DAgger",
         )
+
+        losses = trainer.train(
+            num_batch_collection_steps=20,
+            num_training_steps_per_batch_collection=1000,
+            num_trajectories_per_batch_collection=20,
+            batch_size=128,
+        )
+
+        print(f"Final {trainer.mode} loss:", losses[-1])
         # END STUDENT SOLUTION
-        traj_reward = 1
-        while traj_reward > 0:
-            _, _, _, rewards, rgbs = trainer.generate_trajectory(trainer.env, trainer.model, render=True)
-            traj_reward = sum(rewards)
-            print(f"got trajectory with reward {traj_reward}")
-            imageio.mimsave(f'gifs_{trainer.mode}.gif', rgbs, fps=33)
+        _, _, _, rewards, rgbs = trainer.generate_trajectory(trainer.env, trainer.model, render=True)
+        print(f"DAgger rollout return: {sum(rewards):.1f}")
+        imageio.mimsave('gifs_DAgger.gif', rgbs, fps=33)
+
+    else:
+        # BEGIN STUDENT SOLUTION
+        model = SimpleNet(
+            state_dim=24, action_dim=4,
+            hidden_layer_dimension=128, max_episode_length=1600,
+            device=device
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+        trainer = TrainDaggerBC(
+            env=env, model=model, optimizer=optimizer,
+            states=states, actions=actions,
+            expert_model=None, device=device, mode="BC",
+        )
+
+        losses = trainer.train(
+            num_batch_collection_steps=20,
+            num_training_steps_per_batch_collection=1000,
+            num_trajectories_per_batch_collection=20,
+            batch_size=128,
+        )
+
+        print(f"Final {trainer.mode} loss:", losses[-1])
+        # END STUDENT SOLUTION
+        _, _, _, rewards, rgbs = trainer.generate_trajectory(trainer.env, trainer.model, render=True)
+        print(f"BC rollout return: {sum(rewards):.1f}")
+        imageio.mimsave('gifs_BC.gif', rgbs, fps=33)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dagger', action='store_true')
+    parser.add_argument('--dagger', action='store_true', help="Run DAgger instead of BC")
     args = parser.parse_args()
     run_training(args.dagger)
